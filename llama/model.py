@@ -270,38 +270,75 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
+        """
+        LLaMA-2-7b Params:
+            dim             : int   = 4096
+            n_layers        : int   = 32
+            n_heads         : int   = 32
+            max_batch_size  : int   = 32
+            max_seq_len     : int   = 2048
+        """
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
+        # 计算， Q, K, V
+        # print(x.shape)                # shape = [batch, seqlen, dim]                  # [1, 12, 4096]
+        # print(self.wq.weight.shape)   # shape = [dim, dim]                            # [4096, 4096]
+        # print(xq.shape)               # shape = [batch, seqlen, dim]                  # [1, 12, 4096]
+        # print(xk.shape)               # shape = [batch, seqlen, dim]                  # [1, 12, 4096]
+        # print(xv.shape)               # shape = [batch, seqlen, dim]                  # [1, 12, 4096]
+        
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
+        # reshape xq, xk, xv
+        # print(xq.shape)               # shape = [batch, seqlen, n_heads, head_dim]    # [1, 12, 32, 128]
+        # print(xk.shape)               # shape = [batch, seqlen, n_heads, head_dim]    # [1, 12, 32, 128]
+        # print(xv.shape)               # shape = [batch, seqlen, n_heads, head_dim]    # [1, 12, 32, 128]
+        
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
+        # RoPE xq, xk
+        # print(xq.shape)               # shape = [batch, seqlen, n_heads, head_dim]    # [1, 12, 32, 128]
+        # print(xk.shape)               # shape = [batch, seqlen, n_heads, head_dim]    # [1, 12, 32, 128]
+        
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
-
+        # to device
+        # print(self.cache_k.shape)     # shape = [max_batch_size, max_seq_len, n_heads, head_dim]      # [32, 2048, 32, 128]
+        # print(self.cache_v.shape)     # shape = [max_batch_size, max_seq_len, n_heads, head_dim]      # [32, 2048, 32, 128]
+         
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
+        # fill cache_k, fill cache_v
+        
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
-
+        # slice
+        # print(keys.shape)             # [bs, cache_len + seqlen, n_heads, head_dim]   # [1, cache_len + 12, 32, 128]
+        # print(values.shape)           # [bs, cache_len + seqlen, n_heads, head_dim]   # [1, cache_len + 12, 32, 128]
+        
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        keys = repeat_kv(keys, self.n_rep)  
+        values = repeat_kv(values, self.n_rep)  
+        # print(keys.shape)             # [bs, cache_len + seqlen, n_heads, head_dim]   # [1, cache_len + 12, 32, 128]
+        # print(values.shape)           # [bs, cache_len + seqlen, n_heads, head_dim]   # [1, cache_len + 12, 32, 128]
+        
+        xq = xq.transpose(1, 2)         # [bs, n_heads, seqlen, head_dim]               # [1, 32, 12, 128]
+        keys = keys.transpose(1, 2)     # [bs, n_heads, cache_len + seqlen, head_dim]   # [1, 32, cache_len + 12, 128]
+        values = values.transpose(1, 2) # [bs, n_heads, cache_len + seqlen, head_dim]   # [1, 32, cache_len + 12, 128]
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # [bs, n_heads, seqlen, head_dim] @ [bs, n_heads, head_dim, cache_len + seqlen] 
+        # print(scores.shape)           # [bs, n_heads, seqlen, cache_len + seqlen]     # [1, 32, 12, cache_len + 12]
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask      # [bs, n_heads, seqlen, cache_len + seqlen]     # [1, 32, 12, cache_len + 12]
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+        # print(scores.shape)           # [bs, n_heads, seqlen, cache_len + seqlen]     # [1, 32, 12, cache_len + 12]
+        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
+        # [bs, n_heads, seqlen, cache_len + seqlen] @ [bs, n_heads, cache_len + seqlen, head_dim]
+        # print(output.shape)           # [bs, n_heads, seqlen, head_dim]               # [1, 32, 12, 128]
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)              
+        # print(output.shape)           # [bs, sqelen, dim]                             # [1, 12, 4096]
+        # return [bs, sqelen, dim] @ [dim, dim] = [bs, sqelen, dim]                     # [1, 12, 4096]
+        return self.wo(output)    
 
 
 class FeedForward(nn.Module):
@@ -467,7 +504,9 @@ class Transformer(nn.Module):
 
         """
         _bsz, seqlen = tokens.shape
+        print(seqlen)
         h = self.tok_embeddings(tokens)
+        print(h.shape)
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
